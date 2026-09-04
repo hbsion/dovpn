@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+set -e
+
+ACTION="$1"
+shift || true
+
+PID_DIR="/var/run/vpn_nodes"
+LOG_DIR="/var/log/vpn_nodes"
+CONF_DIR="/etc/vpn_nodes"
+NODES_CONF="/etc/vpn_nodes/nodes.conf"
+mkdir -p "${PID_DIR}" "${LOG_DIR}" "${CONF_DIR}"
+
+HOST_IF=$(ip route get 1.1.1.1 2>/dev/null | grep -oP "dev \K\S+" || echo "eth0")
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+GOOGLE_URL="https://policies.google.com/terms?hl=zh-CN&fg=1"
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "\033[31m[错误] 请使用 sudo 执行！\033[0m"
+        exit 1
+    fi
+}
+
+start_single_node() {
+    local node="$1"
+    local ovpn_raw="$2"
+    local port="$3"
+    local auth_file="${4:-/home/VPN/auth.txt}"
+
+    if [ -z "$node" ] || [ -z "$ovpn_raw" ] || [ -z "$port" ]; then
+        echo -e "\033[31m[错误] 节点 $node 缺少启动参数 (ovpn 或 端口)！\033[0m"
+        return 1
+    fi
+
+    if ! command -v gost >/dev/null 2>&1; then
+        echo -e "\033[31m[错误] 未检测到 gost，请先安装 gost！\033[0m"
+        exit 1
+    fi
+
+    stop_node_silent "$node" "$port"
+
+    local netns="ns_${node}"
+    local veth_h="vh_${node}"
+    local veth_n="vn_${node}"
+
+    local ip_offset=$(( (port % 200) + 10 ))
+    local ip_host="10.220.${ip_offset}.1"
+    local ip_ns="10.220.${ip_offset}.2"
+
+    local tmp_ovpn="${CONF_DIR}/${node}.ovpn"
+    sed -E "/auth-user-pass|auth-nocache|auth-retry|update-resolv-conf/d" "$ovpn_raw" > "$tmp_ovpn"
+    echo "auth-user-pass ${auth_file}" >> "$tmp_ovpn"
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    ip netns add "${netns}"
+    ip netns exec "${netns}" ip link set lo up
+
+    mkdir -p "/etc/netns/${netns}"
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > "/etc/netns/${netns}/resolv.conf"
+
+    ip link add "${veth_h}" type veth peer name "${veth_n}"
+    ip link set "${veth_n}" netns "${netns}"
+
+    ip addr add "${ip_host}/24" dev "${veth_h}"
+    ip link set "${veth_h}" up
+
+    ip netns exec "${netns}" ip addr add "${ip_ns}/24" dev "${veth_n}"
+    ip netns exec "${netns}" ip link set "${veth_n}" up
+    ip netns exec "${netns}" ip route add default via "${ip_host}" dev "${veth_n}"
+
+    iptables -t nat -A POSTROUTING -s "10.220.${ip_offset}.0/24" -o "${HOST_IF}" -j MASQUERADE
+    iptables -A FORWARD -i "${veth_h}" -o "${HOST_IF}" -j ACCEPT
+    iptables -A FORWARD -i "${HOST_IF}" -o "${veth_h}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    ip netns exec "${netns}" openvpn \
+        --config "${tmp_ovpn}" \
+        --writepid "${PID_DIR}/${node}.pid" \
+        --log-append "${LOG_DIR}/${node}.log" \
+        --daemon "ovpn_${node}"
+
+    local ok=0
+    for i in $(seq 1 30); do
+        sleep 1
+        if ip netns exec "${netns}" ip addr show 2>/dev/null | grep -q "tun"; then
+            ok=1
+            break
+        fi
+    done
+
+    if [ $ok -eq 0 ]; then
+        echo -e "\033[31m[错误] 节点 ${node} 握手超时！\033[0m"
+        stop_node_silent "$node" "$port"
+        return 1
+    fi
+
+    ip netns exec "${netns}" gost -L "socks5://0.0.0.0:${port}?udp=true" >/dev/null 2>&1 &
+    echo $! > "${PID_DIR}/${node}.gost"
+
+    iptables -t nat -A PREROUTING -p tcp --dport "${port}" -j DNAT --to-destination "${ip_ns}:${port}"
+    iptables -t nat -A OUTPUT -p tcp -o lo --dport "${port}" -j DNAT --to-destination "${ip_ns}:${port}"
+    iptables -t nat -A PREROUTING -p udp --dport "${port}" -j DNAT --to-destination "${ip_ns}:${port}"
+    iptables -A FORWARD -p tcp -d "${ip_ns}" --dport "${port}" -j ACCEPT
+    iptables -A FORWARD -p udp -d "${ip_ns}" --dport "${port}" -j ACCEPT
+    iptables -t nat -A OUTPUT -p udp -o lo --dport "${port}" -j DNAT --to-destination "${ip_ns}:${port}"
+
+    echo "${port}" > "${PID_DIR}/${node}.port"
+    echo "${ip_offset}" > "${PID_DIR}/${node}.offset"
+    echo -e "\033[32m[就绪] 节点 ${node} -> 虚拟 IP: ${ip_ns}:${port}\033[0m"
+}
+
+stop_node_silent() {
+    local N="$1"
+    local P="$2"
+    local NS="ns_${N}"
+    local VH="vh_${N}"
+
+    [ -f "${PID_DIR}/${N}.gost" ] && kill -9 $(cat "${PID_DIR}/${N}.gost") 2>/dev/null || true
+    [ -n "$P" ] && fuser -k -n tcp "$P" 2>/dev/null || true
+    [ -n "$P" ] && fuser -k -n udp "$P" 2>/dev/null || true
+
+    if [ -f "${PID_DIR}/${N}.offset" ]; then
+        local OFF=$(cat "${PID_DIR}/${N}.offset")
+        iptables -t nat -D POSTROUTING -s "10.220.${OFF}.0/24" -o "${HOST_IF}" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -D OUTPUT -p tcp -o lo --dport "${P}" -j DNAT --to-destination "10.220.${OFF}.2:${P}" 2>/dev/null || true
+        iptables -t nat -D PREROUTING -p tcp --dport "${P}" -j DNAT --to-destination "10.220.${OFF}.2:${P}" 2>/dev/null || true
+        iptables -t nat -D OUTPUT -p udp -o lo --dport "${P}" -j DNAT --to-destination "10.220.${OFF}.2:${P}" 2>/dev/null || true
+        iptables -t nat -D PREROUTING -p udp --dport "${P}" -j DNAT --to-destination "10.220.${OFF}.2:${P}" 2>/dev/null || true
+    fi
+
+    if ip netns list | grep -qw "${NS}"; then
+        ip netns pids "${NS}" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns delete "${NS}" 2>/dev/null || true
+    fi
+    rm -rf "/etc/netns/${NS}"
+    ip link delete "${VH}" 2>/dev/null || true
+    rm -f "${PID_DIR}/${N}".*
+}
+
+get_node_conf() {
+    local target_node="$1"
+    if [ ! -f "$NODES_CONF" ]; then
+        return 1
+    fi
+    grep -E "^[[:space:]]*${target_node}[[:space:]]*\|" "$NODES_CONF" | head -n 1 || true
+}
+
+start_node() {
+    check_root
+    if [ $# -eq 0 ]; then
+        echo "用法: sudo vpn start <节点1> [节点2 ...] 或 sudo vpn start <节点名> <ovpn路径> <端口> [auth.txt]"
+        exit 1
+    fi
+
+    # 兼容单节点直接带完整参数启动
+    if [ $# -ge 3 ] && [[ "$2" == *.* ]] && [[ "$3" =~ ^[0-9]+$ ]]; then
+        start_single_node "$1" "$2" "$3" "$4"
+        return
+    fi
+
+    for n in "$@"; do
+        local line
+        line=$(get_node_conf "$n")
+        if [ -z "$line" ]; then
+            echo -e "\033[31m[跳过] 在 ${NODES_CONF} 中未找到节点 [${n}] 的配置！\033[0m"
+            continue
+        fi
+
+        IFS="|" read -r _ n_ovpn n_port n_auth <<< "$line"
+        local ovpn=$(echo "$n_ovpn" | tr -d ' ')
+        local port=$(echo "$n_port" | tr -d ' ')
+        local auth=$(echo "$n_auth" | tr -d ' ')
+        [ -z "$auth" ] && auth="/home/VPN/auth.txt"
+
+        echo -e "\033[33m>> 正在启动节点: ${n} (端口: ${port})...\033[0m"
+        start_single_node "$n" "$ovpn" "$port" "$auth" || true
+    done
+}
+
+stop_node() {
+    check_root
+    if [ $# -eq 0 ]; then
+        echo "用法: sudo vpn stop <节点1> [节点2 ...]"
+        exit 1
+    fi
+
+    for n in "$@"; do
+        local p=""
+        [ -f "${PID_DIR}/${n}.port" ] && p=$(cat "${PID_DIR}/${n}.port")
+        stop_node_silent "$n" "$p"
+        echo -e "\033[32m[完成] 节点 ${n} 已停止。\033[0m"
+    done
+}
+
+restart_node() {
+    check_root
+    if [ $# -eq 0 ]; then
+        echo "用法: sudo vpn restart <节点1> [节点2 ...] 或 sudo vpn restart <节点名> <ovpn路径> <端口> [auth.txt]"
+        exit 1
+    fi
+
+    # 兼容单节点重载新参数
+    if [ $# -ge 3 ] && [[ "$2" == *.* ]] && [[ "$3" =~ ^[0-9]+$ ]]; then
+        local p_old=""
+        [ -f "${PID_DIR}/$1.port" ] && p_old=$(cat "${PID_DIR}/$1.port")
+        stop_node_silent "$1" "$p_old"
+        start_single_node "$1" "$2" "$3" "$4"
+        return
+    fi
+
+    for n in "$@"; do
+        local line
+        line=$(get_node_conf "$n")
+        if [ -z "$line" ]; then
+            echo -e "\033[31m[跳过] 在 ${NODES_CONF} 中未找到节点 [${n}] 的配置！\033[0m"
+            continue
+        fi
+
+        IFS="|" read -r _ n_ovpn n_port n_auth <<< "$line"
+        local ovpn=$(echo "$n_ovpn" | tr -d ' ')
+        local port=$(echo "$n_port" | tr -d ' ')
+        local auth=$(echo "$n_auth" | tr -d ' ')
+        [ -z "$auth" ] && auth="/home/VPN/auth.txt"
+
+        echo -e "\033[33m>> 正在重启节点: ${n}...\033[0m"
+        local p_old=""
+        [ -f "${PID_DIR}/${n}.port" ] && p_old=$(cat "${PID_DIR}/${n}.port")
+        stop_node_silent "$n" "$p_old"
+        start_single_node "$n" "$ovpn" "$port" "$auth" || true
+    done
+}
+
+print_node_info() {
+    local N="$1"
+    local P="$2"
+    local NS="ns_${N}"
+    local OFF=$(cat "${PID_DIR}/${N}.offset" 2>/dev/null || echo "10")
+    local IP_NS="10.220.${OFF}.2:${P}"
+
+    local IP
+    IP=$(ip netns exec "${NS}" curl -s --max-time 3 "https://api.ip.sb/ip" 2>/dev/null | tr -d '\r\n ' || true)
+    if [ -z "$IP" ]; then
+        IP=$(ip netns exec "${NS}" curl -s --max-time 3 "https://api.ipify.org" 2>/dev/null | tr -d '\r\n ' || echo "--")
+    fi
+
+    local CF_TRACE
+    CF_TRACE=$(ip netns exec "${NS}" curl -s --max-time 3 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+    local CF_COLO=$(echo "$CF_TRACE" | grep -oP 'colo=\K\S+' || echo "--")
+    local CF_LOC=$(echo "$CF_TRACE" | grep -oP 'loc=\K\S+' || echo "--")
+    local CF_TAG="${CF_LOC}/${CF_COLO}"
+
+    local G_HTML
+    G_HTML=$(ip netns exec "${NS}" curl -sL --max-time 4 -A "$UA" "$GOOGLE_URL" 2>/dev/null || true)
+    local G_GEO
+    G_GEO=$(echo "$G_HTML" | grep -oP '国家/地区版本：</a>\s*\K[^<]+' | head -n 1 | tr -d '\r\n ' || true)
+    if [ -z "$G_GEO" ]; then
+        G_GEO=$(echo "$G_HTML" | grep -oP '"gl":"\K[A-Z]{2}' | head -n 1 || echo "--")
+    fi
+
+    local IP_API_RES
+    IP_API_RES=$(ip netns exec "${NS}" curl -s --max-time 3 "http://ip-api.com/json/?fields=regionName,city&lang=zh-CN" 2>/dev/null || true)
+    local GEO_REGION=$(echo "$IP_API_RES" | grep -oP '"regionName":"\K[^"]+' || echo "")
+    local GEO_CITY=$(echo "$IP_API_RES" | grep -oP '"city":"\K[^"]+' || echo "")
+    local LOCATION="${GEO_REGION} ${GEO_CITY}"
+    LOCATION=$(echo "$LOCATION" | sed 's/^[ \t]*//;s/[ \t]*$//')
+    [ -z "$LOCATION" ] && LOCATION="--"
+
+    printf "\033[33m%-11s\033[0m │ 虚拟IP: \033[32m%-18s\033[0m │ 出口IP: \033[36m%-15s\033[0m │ CF: \033[35m%-7s\033[0m │ Google: \033[32m%-6s\033[0m   \033[34m%s\033[0m\n" \
+        "${N}" "${IP_NS}" "${IP}" "${CF_TAG}" "${G_GEO}" "${LOCATION}"
+}
+
+check_node() {
+    if [ $# -eq 0 ]; then
+        echo "用法: vpn check <节点1> [节点2 ...]"
+        exit 1
+    fi
+
+    for n in "$@"; do
+        local ns="ns_${n}"
+        if ! ip netns list | grep -qw "${ns}"; then
+            echo -e "\033[31m[离线] 节点 ${n} 未运行\033[0m"
+            continue
+        fi
+
+        local p=""
+        [ -f "${PID_DIR}/${n}.port" ] && p=$(cat "${PID_DIR}/${n}.port")
+        print_node_info "$n" "$p"
+    done
+}
+
+start_all() {
+    check_root
+    if [ ! -f "$NODES_CONF" ]; then
+        echo -e "\033[31m[错误] 配置文件不存在: ${NODES_CONF}\033[0m"
+        exit 1
+    fi
+    echo -e "\033[36m=== 正在批量启动所有 VPN 节点 ===\033[0m"
+    while IFS="|" read -r n_name n_ovpn n_port n_auth || [ -n "$n_name" ]; do
+        [[ "$n_name" =~ ^[[:space:]]*# ]] && continue
+        [ -z "$(echo "$n_name" | tr -d ' ')" ] && continue
+
+        local N=$(echo "$n_name" | tr -d ' ')
+        local O=$(echo "$n_ovpn" | tr -d ' ')
+        local P=$(echo "$n_port" | tr -d ' ')
+        local A=$(echo "$n_auth" | tr -d ' ')
+        [ -z "$A" ] && A="/home/VPN/auth.txt"
+
+        echo -e "\033[33m>> 正在启动节点: ${N} (端口: ${P})...\033[0m"
+        start_single_node "$N" "$O" "$P" "$A" || true
+    done < "$NODES_CONF"
+    echo -e "\033[32m=== 所有节点启动完成 ===\033[0m"
+}
+
+stop_all() {
+    check_root
+    echo -e "\033[33m=== 正在停止所有 VPN 节点 ===\033[0m"
+    for f in ${PID_DIR}/*.port; do
+        [ -e "$f" ] || continue
+        local N=$(basename "$f" .port)
+        local P=$(cat "$f")
+        stop_node_silent "$N" "$P"
+        echo -e "已清理节点: ${N}"
+    done
+    echo -e "\033[32m=== 全部节点已停止 ===\033[0m"
+}
+
+list_nodes() {
+    local found=0
+    for f in ${PID_DIR}/*.port; do
+        [ -e "$f" ] && { found=1; break; }
+    done
+
+    if [ $found -eq 0 ]; then
+        echo "当前没有正在运行的节点。"
+        return
+    fi
+
+    echo -e "\033[36m============================== 运行中的 VPN 节点列表 ==============================\033[0m"
+
+    for f in ${PID_DIR}/*.port; do
+        [ -e "$f" ] || continue
+        local N=$(basename "$f" .port)
+        local P=$(cat "$f")
+        print_node_info "$N" "$P"
+    done
+    echo -e "\033[36m===================================================================================\033[0m"
+}
+
+case "$ACTION" in
+    start)        start_node "$@" ;;
+    stop)         stop_node "$@" ;;
+    restart)      restart_node "$@" ;;
+    check|status) check_node "$@" ;;
+    start-all)    start_all ;;
+    stop-all)     stop_all ;;
+    restart-all)  stop_all && start_all ;;
+    list|ls)      list_nodes ;;
+    log)          tail -n 40 -f "${LOG_DIR}/${1}.log" ;;
+    *)            echo "用法: vpn {start|stop|restart|check|status|start-all|stop-all|restart-all|list|log} [节点...]" ;;
+esac
