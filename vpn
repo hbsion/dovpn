@@ -9,6 +9,9 @@ LOG_DIR="/var/log/vpn_nodes"
 CONF_DIR="/etc/vpn_nodes"
 NODES_CONF="/etc/vpn_nodes/nodes.conf"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
+KEEPALIVE_CONNECT_TIMEOUT="${KEEPALIVE_CONNECT_TIMEOUT:-5}"
+KEEPALIVE_MAX_TIME="${KEEPALIVE_MAX_TIME:-8}"
+KEEPALIVE_PROBE_URLS="${KEEPALIVE_PROBE_URLS:-https://api.ipify.org http://1.1.1.1/cdn-cgi/trace}"
 mkdir -p "${PID_DIR}" "${LOG_DIR}" "${CONF_DIR}"
 
 HOST_IF=$(ip route get 1.1.1.1 2>/dev/null | grep -oP "dev \K\S+" || echo "eth0")
@@ -148,6 +151,25 @@ should_keepalive_restart_node() {
     if ! ip netns exec "${ns}" ip addr show 2>/dev/null | grep -q "tun"; then
         return 0
     fi
+
+    if ! keepalive_network_ok "$ns"; then
+        return 0
+    fi
+
+    return 1
+}
+
+keepalive_network_ok() {
+    local ns="$1"
+    local probe_url=""
+
+    command -v curl >/dev/null 2>&1 || return 1
+
+    for probe_url in $KEEPALIVE_PROBE_URLS; do
+        if ip netns exec "$ns" curl -sS --connect-timeout "$KEEPALIVE_CONNECT_TIMEOUT" --max-time "$KEEPALIVE_MAX_TIME" "$probe_url" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
 
     return 1
 }
