@@ -8,6 +8,7 @@ PID_DIR="/var/run/vpn_nodes"
 LOG_DIR="/var/log/vpn_nodes"
 CONF_DIR="/etc/vpn_nodes"
 NODES_CONF="/etc/vpn_nodes/nodes.conf"
+KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
 mkdir -p "${PID_DIR}" "${LOG_DIR}" "${CONF_DIR}"
 
 HOST_IF=$(ip route get 1.1.1.1 2>/dev/null | grep -oP "dev \K\S+" || echo "eth0")
@@ -26,6 +27,7 @@ start_single_node() {
     local ovpn_raw="$2"
     local port="$3"
     local auth_file="${4:-/home/VPN/auth.txt}"
+    local enable_keepalive="${5:-yes}"
 
     if [ -z "$node" ] || [ -z "$ovpn_raw" ] || [ -z "$port" ]; then
         echo -e "\033[31m[错误] 节点 $node 缺少启动参数 (ovpn 或 端口)！\033[0m"
@@ -37,7 +39,11 @@ start_single_node() {
         exit 1
     fi
 
-    stop_node_silent "$node" "$port"
+    if [ "$enable_keepalive" = "yes" ]; then
+        stop_node_silent "$node" "$port"
+    else
+        stop_node_silent "$node" "$port" "keepalive"
+    fi
 
     local netns="ns_${node}"
     local veth_h="vh_${node}"
@@ -105,14 +111,88 @@ start_single_node() {
 
     echo "${port}" > "${PID_DIR}/${node}.port"
     echo "${ip_offset}" > "${PID_DIR}/${node}.offset"
+    echo "${ovpn_raw}|${port}|${auth_file}" > "${PID_DIR}/${node}.args"
+    [ "$enable_keepalive" = "yes" ] && start_keepalive "$node" "$ovpn_raw" "$port" "$auth_file"
     echo -e "\033[32m[就绪] 节点 ${node} -> 虚拟 IP: ${ip_ns}:${port}\033[0m"
+}
+
+pid_file_alive() {
+    local pid_file="$1"
+    local pid=""
+
+    [ -f "$pid_file" ] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+should_keepalive_restart_node() {
+    local node="$1"
+    local port="$2"
+    local ns="ns_${node}"
+
+    [ -n "$port" ] || return 0
+
+    if ! ip netns list 2>/dev/null | grep -qw "${ns}"; then
+        return 0
+    fi
+
+    if ! pid_file_alive "${PID_DIR}/${node}.pid"; then
+        return 0
+    fi
+
+    if ! pid_file_alive "${PID_DIR}/${node}.gost"; then
+        return 0
+    fi
+
+    if ! ip netns exec "${ns}" ip addr show 2>/dev/null | grep -q "tun"; then
+        return 0
+    fi
+
+    return 1
+}
+
+keepalive_loop() {
+    local node="$1"
+    local ovpn_raw="$2"
+    local port="$3"
+    local auth_file="$4"
+
+    while true; do
+        sleep "$KEEPALIVE_INTERVAL"
+        if should_keepalive_restart_node "$node" "$port"; then
+            echo "[$(date '+%F %T')] 节点 ${node} 异常，正在单独重启..."
+            stop_node_silent "$node" "$port" "keepalive"
+            start_single_node "$node" "$ovpn_raw" "$port" "$auth_file" "no" || true
+        fi
+    done
+}
+
+start_keepalive() {
+    local node="$1"
+    local ovpn_raw="$2"
+    local port="$3"
+    local auth_file="$4"
+
+    if [ -f "${PID_DIR}/${node}.keepalive" ]; then
+        kill "$(cat "${PID_DIR}/${node}.keepalive")" 2>/dev/null || true
+        rm -f "${PID_DIR}/${node}.keepalive"
+    fi
+
+    keepalive_loop "$node" "$ovpn_raw" "$port" "$auth_file" >> "${LOG_DIR}/${node}.keepalive.log" 2>&1 &
+    echo $! > "${PID_DIR}/${node}.keepalive"
 }
 
 stop_node_silent() {
     local N="$1"
     local P="$2"
+    local keepalive_mode="${3:-stop}"
     local NS="ns_${N}"
     local VH="vh_${N}"
+
+    if [ "$keepalive_mode" != "keepalive" ] && [ -f "${PID_DIR}/${N}.keepalive" ]; then
+        kill "$(cat "${PID_DIR}/${N}.keepalive")" 2>/dev/null || true
+    fi
 
     [ -f "${PID_DIR}/${N}.gost" ] && kill -9 $(cat "${PID_DIR}/${N}.gost") 2>/dev/null || true
     [ -n "$P" ] && fuser -k -n tcp "$P" 2>/dev/null || true
@@ -133,7 +213,11 @@ stop_node_silent() {
     fi
     rm -rf "/etc/netns/${NS}"
     ip link delete "${VH}" 2>/dev/null || true
-    rm -f "${PID_DIR}/${N}".*
+    if [ "$keepalive_mode" = "keepalive" ]; then
+        rm -f "${PID_DIR}/${N}.gost" "${PID_DIR}/${N}.pid" "${PID_DIR}/${N}.port" "${PID_DIR}/${N}.offset" "${PID_DIR}/${N}.args"
+    else
+        rm -f "${PID_DIR}/${N}".*
+    fi
 }
 
 get_node_conf() {
